@@ -52,6 +52,31 @@ Optional required-by-mode variables:
 | `TEAMS_BOT_APP_ID`, `TEAMS_BOT_APP_PASSWORD`, `TEAMS_BOT_APP_TENANT_ID` | Local shell before `just bootstrap-secrets`; production Secret. | Required by Teamsbot when `teamsbot.enabled=true`. |
 | `TEAMSBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when Teams credentials are present and it is omitted. | Static API key used by Teamsbot. |
 
+## Console and Permission Control Plane
+
+The Console stores principals, roles, grants, sandbox capabilities, and
+encrypted secret-source configuration. The chart renders its internal URL and
+admin API key into api-rs. See [Advanced Permissioning](/secrets/advanced-permissioning)
+for the operator workflow.
+
+| Env var or value | Set from | Controls |
+| --- | --- | --- |
+| `IRON_CONTROL_DATABASE_URL` | `secretManager.existingSecretName`. | Console database connection. Keep it separate from the api-rs logical database. |
+| `IRON_CONTROL_INITIAL_USER_EMAIL`, `IRON_CONTROL_INITIAL_USER_PASSWORD` | `secretManager.existingSecretName`; local bootstrap generates defaults when absent. | Creates the initial Console admin when no user exists. |
+| `IRON_CONTROL_INITIAL_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when absent. | Admin API key used by api-rs and `centaur-perms`. |
+| `IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY`, `IRON_CONTROL_AR_ENCRYPTION_DETERMINISTIC_KEY`, `IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT` | `secretManager.existingSecretName`; local bootstrap generates them when absent. | Encrypts credential material at rest. Keep these stable after first boot. |
+| `IRON_CONTROL_SECRET_KEY_BASE` | `secretManager.existingSecretName`; local bootstrap generates it when absent. | Console session and application signing secret. |
+| `CENTAUR_JWT_SIGNING_SECRET` | `secretManager.existingSecretName`; local bootstrap generates it when absent. | Signs Console-issued MCP access tokens. |
+| `console.publicUrl` | Helm value. | Public Console origin used for links and MCP authorization metadata. |
+| `console.passwordLoginEnabled` | Helm value, default `true`. | Enables the break-glass email and password login. Disable after SSO is configured for a public Console. |
+| `console.ssoEmailDomains` | Helm value. | Limits Google or Slack SSO admission by email domain. Empty accepts any IdP-authenticated email. |
+| `apiRs.syncInfraSecrets`, `IRON_CONTROL_SYNC_INFRA_SECRETS` | Helm value, default `true`. | Upserts the shared `infra` role and its harness/platform secrets. Set false only when another process owns that shared Console state. |
+| `IRON_CONTROL_URL`, `IRON_CONTROL_API_KEY`, `IRON_CONTROL_NAMESPACE` | Chart-rendered for api-rs; operator shell for `centaur-perms`. | Connects the runtime or CLI to the same Console namespace. |
+
+Default roles and default sandbox capabilities are stored in the Console, not
+as Helm values. Configure them in **System Settings** before new principals are
+created. Changing a default does not rewrite existing principals.
+
 ## API
 
 | Env var | Set from | Controls |
@@ -81,6 +106,7 @@ Optional required-by-mode variables:
 | `CENTAUR_ENVIRONMENT`, `DEPLOY_ENV`, `ENVIRONMENT` | `apiRs.extraEnv` or deployment env. | Deployment environment resource attribute for telemetry. |
 | `OTEL_TRACES_EXPORTER` | `apiRs.extraEnv`. | Set to `otlp` to force OTLP trace export, or `none`/`off` to disable it. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `apiRs.extraEnv`. | Enables OTLP trace export to Tempo, Jaeger, or another OTLP collector. |
+| `apiRs.workflowHostSandbox`, `WORKFLOW_HOST_SANDBOX` | Helm value, default `true`; override with `apiRs.extraEnv`. | Runs workflow hosts in Kubernetes sandboxes instead of the api-rs process. Required for workflow-scoped principals. |
 | `apiRs.metrics.scrapeAnnotations` | Helm value, default `true`. | Adds Prometheus scrape annotations to the API-RS Pod template and Service. |
 | `apiRs.metrics.path` | Helm value, default `/metrics`. | Metrics scrape path for annotation-based discovery. |
 | `apiRs.metrics.annotations` | Helm value. | Additional scrape annotations for Prometheus-compatible collectors. |
@@ -133,6 +159,7 @@ Execution tuning:
 | `SLACK_FEEDBACK_COMMANDS`, `SLACK_FEEDBACK_ALLOWED_CHANNELS` | `slackbot.extraEnv`. | Feedback slash commands and optional channel allowlist. |
 | `SLACK_FEEDBACK_LINEAR_TEAM_ID`, `SLACK_FEEDBACK_LINEAR_PROJECT_ID` | `slackbot.extraEnv`. | Linear destination for feedback issues. |
 | `SLACKBOT_EXTERNAL_ORG_ALLOWLIST` | `slackbot.extraEnv`. | Slack team ids allowed for external org handoff. |
+| `SLACKBOTV2_AUTO_JOIN_CREATED_CHANNELS` | `slackbotv2.autoJoinCreatedChannels`. | Joins newly-created public channels after subscribed `channel_created` events. Requires `channels:read` and `channels:join`. Defaults to `false`. |
 | `SLACKBOTV2_DEFAULT_HARNESS` | `sandbox.harnessEngine`. | Base harness for new Slack threads without an explicit flag or channel default. |
 | `SESSION_CODEX_NANOCODEX_ROLLOUT_PERCENT` | `apiRs.codexNanocodexRolloutPercent`. | Percentage of API session requests for Codex assigned to Nanocodex. Assignment is deterministic by thread key and persisted as the session harness. The API response and structured `session_harness_rollout_resolved` log identify the experiment and cohort; session and execution metadata retain the assignment for later analysis. Slack keeps the cohort unobtrusive by showing `Codex*` in the first response footer. Defaults to `50`; set to `0` to keep new Codex requests on Codex. |
 | `SLACKBOTV2_CHANNEL_DEFAULTS` | `slackbotv2.channelDefaults`. | Per-channel default harness / model / provider / reasoning as a JSON object keyed by Slack conversation id, where each value is an object of optional `harness`/`model`/`provider`/`reasoning` fields (same vocabulary as the inline flags, so `harness: claude`, `provider: bedrock`, and Claude model aliases like `opus` all work), e.g. `{"C0ENG":{"harness":"claude","model":"opus","reasoning":"high"},"C0TRIAGE":{"reasoning":"low"}}`. A model is only meaningful within a harness, so name the harness alongside it. Applied when a message in that channel carries no explicit/sticky per-thread flag (below such a flag, above the deployment/baked default) and forwarded onto the harness input line so it takes effect; setting the harness restarts a thread onto it like a `--claude`/`--codex` flag. `reasoning` affects the Codex and Nanocodex harnesses. Malformed JSON and unrecognized field values are logged and ignored. |
@@ -182,6 +209,7 @@ Kubernetes backend:
 | `KUBERNETES_SANDBOX_RUNTIME_CLASS_NAME`, `KUBERNETES_SANDBOX_SERVICE_ACCOUNT_NAME` | `sandbox.runtimeClassName`, `api.extraEnv`. | Pod runtime class and service account. |
 | `KUBERNETES_SANDBOX_CPU_LIMIT`, `KUBERNETES_SANDBOX_MEMORY_LIMIT`, `KUBERNETES_SANDBOX_CPU_REQUEST`, `KUBERNETES_SANDBOX_MEMORY_REQUEST` | `sandbox.resources.*`. | Sandbox pod resources. |
 | `KUBERNETES_SANDBOX_READY_TIMEOUT_S`, `KUBERNETES_ATTACH_LOG_TAIL_LINES` | `api.extraEnv`. | Sandbox readiness and attach diagnostics. |
+| `SESSION_SANDBOX_RUNNING_LIMIT`, `SESSION_SANDBOX_HOT_IDLE_GRACE_SECS` | `apiRs.sandboxRunningLimit`, `apiRs.sandboxHotIdleGraceSecs`. | Capacity admission for running-like sandboxes; discards ready warm sandboxes first, then pauses least-recently-active idle sessions outside the grace window. |
 | `SESSION_SANDBOX_CLEANUP_INTERVAL_SECS`, `SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS` | `apiRs.sandboxCleanupIntervalSecs`, `apiRs.sandboxIdleCleanupBackstopSecs`. | DB-aware cleanup of unreferenced sandboxes and restart recovery for idle pauses. Persisted `idle_timeout_ms` is honored after restart; the backstop is the fallback for older execution rows without that metadata. |
 | `KUBERNETES_SANDBOX_EXTRA_ENV` | `sandbox.extraEnv`. | JSON list copied into each sandbox. |
 | `KUBERNETES_WORKFLOW_DIRS` | Chart-rendered from `overlays.sources[*].workflowsSubdir` (default `workflows`) using the sandbox repo-cache mount prefix. | Workflow-host sandbox discovery paths. |
@@ -202,8 +230,6 @@ Sandbox entrypoint and wrappers:
 | --- | --- | --- |
 | `CENTAUR_HARNESS_CONFIG_DIR`, `CENTAUR_HARNESS_ADAPTER` | Sandbox image or `sandbox.extraEnv`. | Harness config directory and optional adapter executable. |
 | `CENTAUR_SKILL_DIRS` | Chart-rendered from `overlays.sources[*].skillsSubdir` (default `.agents/skills`) through `SESSION_SANDBOX_EXTRA_ENV`. | Ordered skill directories copied into the agent workspace. |
-| `CENTAUR_TOOLS_AUTO_RELOAD` | `repoCache.autoReload` via api-rs tools config; defaults to `true`. | Enables repo-cache-backed auto-refresh of local tool shims and copied skills in running sandboxes. Runtime catalog only; secret grants/proxy credentials reconcile separately. |
-| `CENTAUR_TOOLS_RELOAD_INTERVAL_SECONDS` | `sandbox.extraEnv`. | Poll interval for the repo-cache checkout watchdog. |
 | `AGENT_REPO`, `AGENT_PERSONA` | Runtime assignment metadata. | Workspace repo clone and persona prompt. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Sandbox entrypoint or `sandbox.extraEnv`. | Google ADC path; entrypoint creates a local stub when unset. |
 | `CODEX_API_KEY`, `CODEX_HOME`, `CODEX_CONTINUE_THREAD_ID` | `sandbox.extraEnv` or runtime resume. | Codex auth/config/resume behavior. |
@@ -211,8 +237,6 @@ Sandbox entrypoint and wrappers:
 | `META_AI_API_KEY` | Secret mounted into api-rs. | Meta AI direct credential for Codex provider `responses` and Slack or Linear `--meta` selection. |
 | `CODEX_MODEL_REASONING_SUMMARY` | `sandbox.extraEnv`. | Sets `model_reasoning_summary` in the Codex config (`auto`, `concise`, `detailed`, `none`). Codex >= 0.139 emits no reasoning summaries unless this is set, so renderers show no thinking trace. |
 | `CODEX_MODEL_REASONING_EFFORT` | `sandbox.extraEnv`. | Overrides the Codex `model_reasoning_effort` (baked into `harness/codex/config.toml`) and Nanocodex's default thinking effort. It is mirrored into Slackbot so the first response footer displays the effective level. One of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; an unknown value is ignored (the config default stands). |
-| `CODEX_BEDROCK_REGION` | `sandbox.extraEnv`. | Opt-in switch and single source of truth for the Bedrock region. When set, the control plane registers the AWS SigV4 re-signing credential (scoped to the `bedrock` service and this region, upstream `bedrock-mantle.<region>.api.aws`), injects the placeholder `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env so codex can sign requests iron-proxy re-signs with the real IAM keys, and pins codex's `amazon-bedrock` provider to this region at sandbox boot (so the in-sandbox client and the proxy agree). Unset disables Bedrock; defaults to `us-east-1`. See [Codex with Amazon Bedrock](/deploying-in-production#codex-with-amazon-bedrock). |
-| `CODEX_BEDROCK_SESSION_TOKEN` | `sandbox.extraEnv`. | Set truthy when the Bedrock IAM credentials are temporary (STS) and carry a session token, so the `AWS_SESSION_TOKEN` placeholder is declared and injected. Omit for long-term IAM user keys. |
 | `CLAUDE_MODEL`, `CLAUDE_CONTINUE_SESSION_ID` | `sandbox.extraEnv` or runtime resume. | Claude model and resume behavior. |
 | `CLAUDE_CODE_AUTH_MODE` | `sandbox.extraEnv`. | Claude Code auth flow: `api_key` (default, uses `ANTHROPIC_API_KEY`) or `access_token` (Claude.ai Pro or Max via the brokered OAuth login). See [Claude Auth Modes](/deploying-in-production#claude-auth-modes). |
 | `DEPLOY_ENV`, `ENVIRONMENT`, `TRACEPARENT` | Deployment env or wrapper-generated. | Runtime environment and trace context. |
@@ -242,7 +266,6 @@ Slack ETL workflows:
 | `SLACK_RETENTION_ENABLED`, `SLACK_RETENTION_INTERVAL_MINUTES`, `SLACK_ETL_RETENTION_DAYS`, `SLACK_DM_RETENTION_DAYS` | `apiRs.etl.slack.retention.*`. | Slack retention enablement, cadence, and separate public ETL/DM TTLs. |
 | `COMPANY_CONTEXT_DOCUMENTS_ENABLED` | `apiRs.etl.companyContextDocuments.enabled`. | Enables company-context projection when any ETL is on. |
 | `COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS` | `apiRs.etl.companyContextDocuments.maxWindowSeconds`. | Maximum source `updated_at` window projected by one company-context documents run. |
-| `COMPANY_CONTEXT_DOCUMENTS_BATCH_SIZE` | `apiRs.etl.companyContextDocuments.batchSize`. | Maximum changed source rows handled by one per-scope company-context child workflow. |
 
 Google Workspace ETL workflows:
 
