@@ -6,7 +6,7 @@ use centaur_sandbox_core::{SandboxError, SandboxId, SandboxResult, SandboxSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvFromSource,
     EnvVar as K8sEnvVar, HTTPGetAction, Pod, PodSpec, Probe, SecretEnvSource, SecretVolumeSource,
-    SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    SecurityContext, Service, ServicePort, ServiceSpec, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -26,6 +26,8 @@ use crate::{
 
 const IRON_PROXY_LABEL: &str = "centaur.ai/iron-proxy";
 const IRON_CONTROL_PROXY_ID_ANNOTATION: &str = "centaur.ai/iron-control-proxy-id";
+const GKE_GVISOR_TAINT_KEY: &str = "sandbox.gke.io/runtime";
+const GKE_GVISOR_TAINT_VALUE: &str = "gvisor";
 const FIREWALL_CA_MOUNT_PATH: &str = "/firewall-certs";
 pub(crate) const FIREWALL_CA_CERT_PATH: &str = "/firewall-certs/ca-cert.pem";
 const PROXY_MANAGEMENT_PORT: u16 = 9092;
@@ -391,7 +393,13 @@ impl AgentSandboxBackend {
         self.pods()
             .create(
                 &PostParams::default(),
-                &build_iron_proxy_pod(id, iron_proxy, resolved, &sync),
+                &build_iron_proxy_pod(
+                    id,
+                    iron_proxy,
+                    resolved,
+                    &sync,
+                    self.config.runtime_class_name.as_deref(),
+                ),
             )
             .await
             .map_err(|err| map_kube_error("create iron-proxy pod", err))?;
@@ -1226,6 +1234,7 @@ fn build_iron_proxy_pod(
     iron_proxy: &IronProxyConfig,
     resolved: &ResolvedIronProxy,
     sync: &ProxySyncEnv,
+    sandbox_runtime_class_name: Option<&str>,
 ) -> Pod {
     let annotations = BTreeMap::from([
         (
@@ -1251,6 +1260,17 @@ fn build_iron_proxy_pod(
             automount_service_account_token: Some(false),
             restart_policy: Some("Never".to_owned()),
             containers: vec![iron_proxy_container(iron_proxy, resolved, sync)],
+            // GKE taints gVisor-enabled nodes. The trusted proxy remains a runc
+            // Pod, but it must colocate with its gVisor sandbox on that node.
+            tolerations: (sandbox_runtime_class_name == Some("gvisor")).then(|| {
+                vec![Toleration {
+                    effect: Some("NoSchedule".to_owned()),
+                    key: Some(GKE_GVISOR_TAINT_KEY.to_owned()),
+                    operator: Some("Equal".to_owned()),
+                    value: Some(GKE_GVISOR_TAINT_VALUE.to_owned()),
+                    ..Default::default()
+                }]
+            }),
             volumes: Some(iron_proxy_volumes(iron_proxy)),
             ..Default::default()
         }),
@@ -2197,6 +2217,35 @@ mod tests {
     }
 
     #[test]
+    fn iron_proxy_tolerates_gke_gvisor_node_when_sandboxes_use_gvisor() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let resolved = resolved();
+        let sync = ProxySyncEnv {
+            proxy_id: "iprx_test".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "proxy-token".to_owned(),
+            config_hash: None,
+        };
+
+        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync, Some("gvisor"));
+        let tolerations = pod.spec.unwrap().tolerations.unwrap();
+        assert_eq!(tolerations.len(), 1);
+        assert_eq!(tolerations[0].key.as_deref(), Some(GKE_GVISOR_TAINT_KEY));
+        assert_eq!(
+            tolerations[0].value.as_deref(),
+            Some(GKE_GVISOR_TAINT_VALUE)
+        );
+        assert_eq!(tolerations[0].operator.as_deref(), Some("Equal"));
+        assert_eq!(tolerations[0].effect.as_deref(), Some("NoSchedule"));
+
+        for runtime_class in [None, Some("kata")] {
+            let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync, runtime_class);
+            assert!(pod.spec.unwrap().tolerations.is_none());
+        }
+    }
+
+    #[test]
     fn iron_proxy_resources_carry_capability_labels() {
         let id = SandboxId::new("asbx-test");
         let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
@@ -2208,7 +2257,7 @@ mod tests {
             config_hash: None,
         };
 
-        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync);
+        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync, None);
         assert_eq!(
             pod.metadata
                 .labels
@@ -2325,7 +2374,7 @@ mod tests {
             config_hash: None,
         };
 
-        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync);
+        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync, None);
         let pod_labels = pod.metadata.labels.as_ref().unwrap();
         assert!(!pod_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
         assert!(!pod_labels.contains_key(API_SERVER_ENABLED_LABEL));
